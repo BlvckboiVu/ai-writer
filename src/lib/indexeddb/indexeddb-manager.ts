@@ -9,7 +9,7 @@ interface DocumentMetadata {
   aiSuggestions?: any[]
 }
 
-interface Document {
+interface StoredDocument {
   id: string
   userId: string
   title: string
@@ -34,7 +34,7 @@ interface AIContext {
 }
 
 class NovelDexieDB extends Dexie {
-  documents!: Table<Document, string>
+  documents!: Table<StoredDocument, string>
   drafts!: Table<Draft, string>
   aiContext!: Table<AIContext, string>
 
@@ -48,8 +48,12 @@ class NovelDexieDB extends Dexie {
   }
 }
 
+
 class CryptoManager {
   async generateKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
+    if (typeof globalThis === 'undefined' || !('crypto' in globalThis) || !crypto.subtle) {
+      throw new Error('Web Crypto API is not available in this environment')
+    }
     const encoder = new TextEncoder()
     const keyMaterial = await crypto.subtle.importKey(
       'raw',
@@ -62,7 +66,8 @@ class CryptoManager {
     return crypto.subtle.deriveKey(
       {
         name: 'PBKDF2',
-        salt,
+        // pass an ArrayBuffer to satisfy typings
+        salt: salt.buffer as ArrayBuffer,
         iterations: 100000,
         hash: 'SHA-256'
       },
@@ -73,36 +78,55 @@ class CryptoManager {
     )
   }
 
-  async encryptData(data: string, userKey: string): Promise<{ encrypted: Uint8Array; iv: Uint8Array }> {
+  async encryptData(data: string, userKey: string): Promise<{ encrypted: Uint8Array; salt: Uint8Array; gcmIv: Uint8Array; iv: Uint8Array }> {
+    if (typeof globalThis === 'undefined' || !('crypto' in globalThis) || !crypto.subtle) {
+      throw new Error('Web Crypto API is not available in this environment')
+    }
     const encoder = new TextEncoder()
     const salt = crypto.getRandomValues(new Uint8Array(16))
-    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const gcmIv = crypto.getRandomValues(new Uint8Array(12))
 
-    const key = await this.generateKey(userKey, salt)
-    const encrypted = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
-      key,
-      encoder.encode(data)
-    )
+    try {
+      const key = await this.generateKey(userKey, salt)
+      const encrypted = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: gcmIv },
+        key,
+        encoder.encode(data)
+      )
 
-    return {
-      encrypted: new Uint8Array(encrypted),
-      iv: new Uint8Array([...salt, ...iv])
+      return {
+        encrypted: new Uint8Array(encrypted),
+        salt,
+        gcmIv,
+        // keep backward-compatible combined buffer for storage
+        iv: new Uint8Array([...salt, ...gcmIv])
+      }
+    } catch (err) {
+      throw new Error(`encryptData failed: ${(err as Error).message}`)
     }
   }
 
-  async decryptData(encryptedData: Uint8Array, iv: Uint8Array, userKey: string): Promise<string> {
+  async decryptData(encryptedData: Uint8Array | ArrayBuffer, iv: Uint8Array, userKey: string): Promise<string> {
+    if (typeof globalThis === 'undefined' || !('crypto' in globalThis) || !crypto.subtle) {
+      throw new Error('Web Crypto API is not available in this environment')
+    }
     const salt = iv.slice(0, 16)
     const actualIv = iv.slice(16)
 
-    const key = await this.generateKey(userKey, salt)
-    const decrypted = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: actualIv },
-      key,
-      encryptedData
-    )
+    try {
+      const key = await this.generateKey(userKey, salt)
+      // ensure we pass a Uint8Array (which is a BufferSource) to subtle.decrypt
+      const encryptedBuffer = encryptedData instanceof Uint8Array ? encryptedData.buffer as ArrayBuffer : (encryptedData as ArrayBuffer)
+      const decrypted = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: actualIv },
+        key,
+        encryptedBuffer
+      )
 
-    return new TextDecoder().decode(decrypted)
+      return new TextDecoder().decode(decrypted)
+    } catch (err) {
+      throw new Error(`decryptData failed: ${(err as Error).message}`)
+    }
   }
 }
 
@@ -120,7 +144,7 @@ export class SecureIndexedDBManager {
     content: string
     metadata: DocumentMetadata
   }, userKey: string): Promise<void> {
-    const { encrypted, iv } = await this.crypto.encryptData(document.content, userKey)
+  const { encrypted, iv } = await this.crypto.encryptData(document.content, userKey)
 
     await this.db.documents.put({
       id: document.id,
@@ -194,3 +218,20 @@ export class SecureIndexedDBManager {
     return JSON.parse(decrypted)
   }
 }
+
+// Add a function to export all local data for migration
+export async function exportLocalData() {
+  const documents = await db.documents.toArray();
+  const drafts = await db.drafts.toArray();
+  const aiContext = await db.aiContext.toArray();
+  return { documents, drafts, aiContext };
+}
+
+// Add a function to clear local data after migration
+export async function clearLocalData() {
+  await db.documents.clear();
+  await db.drafts.clear();
+  await db.aiContext.clear();
+}
+
+export default db;

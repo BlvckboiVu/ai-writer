@@ -1,5 +1,7 @@
 import { create } from 'zustand'
 import { devtools, persist } from 'zustand/middleware'
+import { supabase } from '../supabase/client';
+import db from '../indexeddb/indexeddb-manager';
 
 interface Project {
   id: string
@@ -20,12 +22,13 @@ interface ProjectState {
   addProject: (project: Project) => void
   updateProject: (id: string, updates: Partial<Project>) => void
   deleteProject: (id: string) => void
+  loadProjects: () => Promise<void>
 }
 
 export const useProjectStore = create<ProjectState>()(
   devtools(
     persist(
-      (set) => ({
+      (set, get) => ({
         projects: [],
         currentProject: null,
         loading: false,
@@ -50,6 +53,26 @@ export const useProjectStore = create<ProjectState>()(
             currentProject:
               state.currentProject?.id === id ? null : state.currentProject,
           })),
+        loadProjects: async () => {
+          const { data: user } = await supabase.auth.getUser();
+          const isGuestMode = !user;
+          if (isGuestMode) {
+            const localProjects = await db.documents.toArray();
+            // Map Document[] to Project[]
+            const mappedProjects = localProjects.map((doc) => ({
+              id: doc.id,
+              title: doc.title,
+              description: '',
+              current_word_count: doc.metadata.wordCount,
+              target_word_count: 0,
+              status: doc.syncStatus,
+            }));
+            set({ projects: mappedProjects });
+          } else {
+            const { data: projects, error } = await supabase.from('projects').select('*');
+            if (!error) set({ projects });
+          }
+        },
       }),
       {
         name: 'project-store',
